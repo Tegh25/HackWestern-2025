@@ -1,0 +1,83 @@
+sequenceDiagram
+autonumber
+actor U as User/Frontend
+participant API as FastAPI Route
+participant S as In-Memory Store
+participant BG as BackgroundTasks
+participant A as Agent Runner
+participant P as Playwright
+participant G as Gemini API
+participant IO as Socket.IO Server
+
+U->>API: POST /api/test/ {url, focus}
+API->>API: Validate TestRequest
+API->>API: Generate test_id
+API->>S: set(test_id, TestRun{status=running})
+API->>BG: add_task(run_agent, test_id, url, focus, sio)
+API-->>U: 200 {id, status=running}
+
+par Live channel setup
+U->>IO: connect with query testId
+IO->>IO: enter_room(sid, test_id)
+and Background execution
+BG->>A: run_agent(...)
+A->>A: run_in_executor(_run_agent_sync)
+
+A->>S: get(test_id)
+A->>P: launch chromium + new page
+A->>P: goto(url)
+A->>P: screenshot
+A->>S: add_action(navigate)
+A->>IO: emit action (navigate)
+
+loop Up to 50 turns
+A->>P: screenshot current page
+A->>G: generate_content(prompt + screenshot)
+G-->>A: JSON decision {action, args, reasoning}
+A->>A: parse_json_response
+
+alt action == done
+A->>P: screenshot final state
+A->>S: add_action(done)
+A->>IO: emit action (done)
+A->>A: break loop
+else executable action
+A->>P: execute_single_action(action, args)
+A->>P: wait_for_load_state + settle
+A->>P: screenshot after action
+A->>S: add_action(action)
+A->>IO: emit action(action)
+else parse failed
+A->>A: skip turn and retry
+end
+end
+
+alt turn limit reached
+A->>P: screenshot timeout state
+A->>S: add_action(done: timeout)
+A->>IO: emit action(done: timeout)
+end
+
+A->>S: update(status=complete, completed_at)
+A->>IO: emit complete
+end
+
+opt client polling fallback
+U->>API: GET /api/test/{test_id}
+API->>S: get(test_id)
+API-->>U: TestRun (status/actions/cases)
+end
+
+opt fetch only cases
+U->>API: GET /api/test/{test_id}/cases
+API->>S: get(test_id)
+API-->>U: {test_id, cases}
+end
+
+alt exception anywhere in agent
+A->>P: try screenshot (if possible)
+A->>S: add_action(done: error)
+A->>IO: emit action(done:error)
+A->>S: update(status=failed)
+A->>IO: emit error
+end
